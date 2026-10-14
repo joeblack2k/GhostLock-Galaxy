@@ -7,10 +7,12 @@
 不使用 shell 权限，采用的是另一条执行路线；两者的运行要求和代码路径并不相同，
 不能直接互换。
 
-## 当前支持设备
+## 已收录的内核偏移版本
 
 | 设备 | Kernel |
 | ---- | ------ |
+| Samsung Galaxy Z Fold6（SM-F9560 / q6q） | `6.1.145-android14-11-3254009-abF9560ZCS4DZI1` |
+| Samsung Galaxy Z Fold6（SM-F9560 / q6q） | `6.1.145-android14-11-3254009-abF9560ZCS4DZH5` |
 | Samsung Galaxy Z Fold6（SM-F9560 / q6q） | `6.1.145-android14-11-3254009-abF9560ZCS4DZG3` |
 
 启动时按 `uname -r` 精确匹配 offset 表，未匹配的内核会直接拒绝运行。
@@ -28,10 +30,10 @@ Shizuku 会以 Android shell 用户启动 payload；APK 自身并不是利用链
 make ghostlock helper
 adb push ghostlock /data/local/tmp/ghostlock
 adb push ghostlock-helper /data/local/tmp/ghostlock-helper
-adb push app/src/main/assets/ksud-zfold6-F9560ZCS4DZG3-samsung-main-no-patch-text-kdp /data/local/tmp/ksud-zfold6-F9560ZCS4DZG3-samsung-main-no-patch-text-kdp
+adb push app/src/main/assets/ksud /data/local/tmp/ksud
 adb shell chmod 755 /data/local/tmp/ghostlock
 adb shell chmod 755 /data/local/tmp/ghostlock-helper
-adb shell chmod 755 /data/local/tmp/ksud-zfold6-F9560ZCS4DZG3-samsung-main-no-patch-text-kdp
+adb shell chmod 755 /data/local/tmp/ksud
 adb shell /data/local/tmp/ghostlock
 ```
 

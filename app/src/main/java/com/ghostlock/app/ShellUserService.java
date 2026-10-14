@@ -25,7 +25,7 @@ public final class ShellUserService extends IGhostlockShell.Stub {
     private static final String STAGE_DIR = "/data/local/tmp/.ghostlock-app";
     private static final String BINARY_NAME = "ghostlock";
     private static final String HELPER_NAME = "ghostlock-helper";
-    private static final String KSUD_NAME = "ksud-zfold6-F9560ZCS4DZG3-samsung-main-no-patch-text-kdp";
+    private static final String KSUD_NAME = "ksud";
     private static final String OUTPUT_END = "\u0000ghostlock-output-end\u0000";
 
     private final Object processLock = new Object();

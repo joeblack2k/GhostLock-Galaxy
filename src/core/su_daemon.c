@@ -28,8 +28,8 @@
 #define BOOTSTRAP_SOCK_PATH "/data/local/tmp/temp_su.sock"
 #define HOLD_READY_SOCKET "cve43499_roothold"
 #define SH_PATH "/system/bin/sh"
-#define DEFAULT_FOLD6_KSUD_PATH "/data/local/tmp/ksud-zfold6-F9560ZCS4DZG3-samsung-main-no-patch-text-kdp"
-#define APP_FOLD6_KSUD_PATH "/data/user/0/com.ghostlock.app/files/ksud-zfold6-F9560ZCS4DZG3-samsung-main-no-patch-text-kdp"
+#define DEFAULT_KSUD_PATH "/data/local/tmp/ksud"
+#define APP_KSUD_PATH "/data/user/0/com.ghostlock.app/files/ksud"
 #define LOGCAT_PATH "/system/bin/logcat"
 #define TRACE_PATH "/data/local/tmp/.ghostlock_ksu.log"
 #define STAGE_TMP_PATH "/data/local/tmp/.ksud-stage.tmp"
@@ -426,8 +426,8 @@ static const char *select_ksud_source(const struct su_request *request) {
   }
 
   static const char *const candidates[] = {
-      DEFAULT_FOLD6_KSUD_PATH,
-      APP_FOLD6_KSUD_PATH,
+      DEFAULT_KSUD_PATH,
+      APP_KSUD_PATH,
       "/data/local/tmp/ksud-selected",
       "/data/local/tmp/ksud",
       "/data/adb/ksud",

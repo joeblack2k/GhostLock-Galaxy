@@ -7,8 +7,13 @@ ifeq ($(OS),Windows_NT)
   CLANG_BASE := aarch64-linux-android$(API)-clang
   NDK_CC := $(NDK_ROOT)/toolchains/llvm/prebuilt/$(PREBUILT)/bin/$(CLANG_BASE).cmd
 else
-  NDK_ROOT ?= $(or $(ANDROID_NDK_HOME),$(ANDROID_NDK_ROOT))
-  PREBUILT := linux-x86_64
+  LOCAL_NDK_ROOT := $(shell sed -n 's/^ghostlock\.ndk\.dir=//p' local.properties 2>/dev/null | head -1)
+  NDK_ROOT ?= $(or $(ANDROID_NDK_HOME),$(ANDROID_NDK_ROOT),$(LOCAL_NDK_ROOT))
+  ifeq ($(shell uname -s),Darwin)
+    PREBUILT := darwin-x86_64
+  else
+    PREBUILT := linux-x86_64
+  endif
   NDK_CC := $(NDK_ROOT)/toolchains/llvm/prebuilt/$(PREBUILT)/bin/aarch64-linux-android$(API)-clang
 endif
 

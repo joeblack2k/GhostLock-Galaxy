@@ -6,6 +6,69 @@
  * pselect_waiter_shift derived from disassembly (raw shift 3, our layout 1).
  */
 
+/* 6.1.145-android14-11-3254009-abF9560ZCS4DZI1 (SM-F9560 / q6q)
+ * Extracted from the supplied devices/boot.img.lz4. kallsyms were recovered
+ * from the embedded kernel table with upstream tools/extract_rs, then the
+ * symbols and BTF fields consumed by this project were resolved with
+ * tools/extract_target.py. pselect and logger offsets were derived from
+ * disassembly. The boot-id pointer slot was confirmed at random_table+0x108.
+ * xbl_config.img was not supplied, so kernel_phys_load and the device-specific
+ * tracefs/runtime tuning carry over from DZH5.
+ */
+OFFSETS_ENTRY(
+    "6.1.145-android14-11-3254009-abF9560ZCS4DZI1",
+    STRUCT_OFFSETS_6_1,
+    .waiter_compact = 1,
+    .tracefs_leak = 1,
+    .tracefs_event_id = 106,
+    .tracefs_caller_off = 0xdb1a0,
+    .umh_root = 1,
+    .sync_route = 1,
+    .off_call_usermodehelper_exec_work = 0x000d39cc,
+    .off_system_unbound_wq = 0x0223ae60,
+    .kimage_text_base = 0xffffffc008000000,
+    .mm_struct_sz = 0x3c0,
+    .page_slab_cache = 0x18,
+    .kernel_phys_load = 0xa8000000,
+    .pselect_waiter_shift = 1,
+    .fops_ioctl = 0x50,
+    .fops_compat_ioctl = 0x58,
+    .fops_mmap = 0x60,
+    .fops_open = 0x70,
+    .fops_release = 0x80,
+    .fops_splice_read = 0xc8,
+    .fops_show_fdinfo = 0xe0,
+    .cred_uid = 0x4,
+    .cred_securebits = 0x24,
+    .cred_caps = 0x28,
+    .cred_security = 0x78,
+    .off_init_task = 0x0224f8c0,
+    .off_init_cred = 0x017af018,
+    .off_root_task_group = 0x0244cd80,
+    .off_selinux_enforcing = 0x02521588,
+    .off_selinux_blob_sizes = 0x0176d9e8,
+    .off_security_hook_heads = 0x0176d2d8,
+    .off_kmalloc_caches = 0x0176ce18,
+    .off_anon_pipe_buf_ops = 0x01219d90,
+    .off_slide_nfulnl_logger = 0x02242a20,
+    .off_slide_boot_id = 0x023762f0,
+    .off_slide_sysctl_bootid = 0x026046e8,
+    .off_configfs_read_iter = 0x004712dc,
+    .off_configfs_bin_write_iter = 0x0047180c,
+    .off_copy_splice_read = 0x003ef340,
+    .off_noop_llseek = 0x003a14e4,
+    .off_slide_loggers_0_1 = 0x02242970,
+    .off_ashmem_misc_fops = 0x023bb600,
+    .off_ashmem_fops = 0x013d1140,
+    .off_ashmem_ioctl = 0x00d3a67c,
+    .off_ashmem_compat_ioctl = 0x00d3afb4,
+    .off_ashmem_mmap = 0x00d3b00c,
+    .off_ashmem_open = 0x00d3b238,
+    .off_ashmem_release = 0x00d3b2c0,
+    .off_ashmem_show_fdinfo = 0x00d3b3e0,
+    .consumer_core = 2,
+),
+
 OFFSETS_ENTRY(
     "6.1.145-android14-11-3254009-abF9560ZCS4DZG3",
     STRUCT_OFFSETS_6_1,

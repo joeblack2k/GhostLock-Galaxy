@@ -49,7 +49,7 @@ public class MainActivity extends Activity {
     private static final String TAG = "GhostLockApp";
     private static final String BINARY_NAME = "libghostlock.so";
     private static final String HELPER_NAME = "ghostlock-helper";
-    private static final String KSUD_NAME = "ksud-zfold6-F9560ZCS4DZG3-samsung-main-no-patch-text-kdp";
+    private static final String KSUD_NAME = "ksud";
     private static final String HELPER_ASSET = HELPER_NAME;
     private static final String KSUD_ASSET = KSUD_NAME;
     private static final String RUN_LOG_NAME = "ghostlock-run.log";

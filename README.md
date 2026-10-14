@@ -8,10 +8,12 @@ permission, obtained through `adb shell` or Shizuku. The original
 shell permission and follows a different execution route; its requirements
 and code path should not be assumed to be interchangeable with this project.
 
-## Supported device
+## Registered kernel profiles
 
 | Device | Kernel |
 | ------ | ------ |
+| Samsung Galaxy Z Fold6 (SM-F9560 / q6q) | `6.1.145-android14-11-3254009-abF9560ZCS4DZI1` |
+| Samsung Galaxy Z Fold6 (SM-F9560 / q6q) | `6.1.145-android14-11-3254009-abF9560ZCS4DZH5` |
 | Samsung Galaxy Z Fold6 (SM-F9560 / q6q) | `6.1.145-android14-11-3254009-abF9560ZCS4DZG3` |
 
 At startup the kernel is matched against the offset table via `uname -r`; unsupported kernels are rejected immediately.
@@ -28,10 +30,10 @@ The direct command-line path runs the same verified shell payload without requir
 make ghostlock helper
 adb push ghostlock /data/local/tmp/ghostlock
 adb push ghostlock-helper /data/local/tmp/ghostlock-helper
-adb push app/src/main/assets/ksud-zfold6-F9560ZCS4DZG3-samsung-main-no-patch-text-kdp /data/local/tmp/ksud-zfold6-F9560ZCS4DZG3-samsung-main-no-patch-text-kdp
+adb push app/src/main/assets/ksud /data/local/tmp/ksud
 adb shell chmod 755 /data/local/tmp/ghostlock
 adb shell chmod 755 /data/local/tmp/ghostlock-helper
-adb shell chmod 755 /data/local/tmp/ksud-zfold6-F9560ZCS4DZG3-samsung-main-no-patch-text-kdp
+adb shell chmod 755 /data/local/tmp/ksud
 adb shell /data/local/tmp/ghostlock
 ```
 
