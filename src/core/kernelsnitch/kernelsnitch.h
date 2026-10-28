@@ -285,7 +285,20 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
         ks->thread_cnt,
         ks->collisions,
         ks->mte_enabled ? "enabled" : "disabled");
-    pin_to_core(0);
+    int ksnitch_core = 0;
+    const char *core_env = getenv("KSNITCH_CORE");
+    if (core_env && *core_env) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long parsed = strtoul(core_env, &end, 0);
+        if (!errno && end != core_env && *end == '\0' &&
+            parsed < (unsigned long)sysconf(_SC_NPROCESSORS_ONLN)) {
+            ksnitch_core = (int)parsed;
+        } else {
+            pr_warning("invalid KSNITCH_CORE=%s; using CPU 0\n", core_env);
+        }
+    }
+    pin_to_core(ksnitch_core);
     futex_init();
 
     ks->state = KERNELSNITCH_INIT;
@@ -302,6 +315,20 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
 #ifndef KERNELSNITCH_THRESHOLD_MULT
 #define KERNELSNITCH_THRESHOLD_MULT 10
 #endif
+    size_t threshold_mult = KERNELSNITCH_THRESHOLD_MULT;
+    const char *threshold_env = getenv("KSNITCH_THRESHOLD_MULT");
+    if (threshold_env && *threshold_env) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long parsed = strtoul(threshold_env, &end, 0);
+        if (!errno && end != threshold_env && *end == '\0' &&
+            parsed >= 2 && parsed <= 1000) {
+            threshold_mult = (size_t)parsed;
+        } else {
+            pr_warning("invalid KSNITCH_THRESHOLD_MULT=%s; using %zu\n",
+                       threshold_env, threshold_mult);
+        }
+    }
     size_t count = 0;
     size_t wanted;
     size_t futex_addr;
@@ -329,7 +356,7 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
         futex_addr = (size_t)&ks->futexes[id];
         ks->scan_done = i;
         ks->times[i] = __measure(futex_addr);
-        if (ks->times[i] > (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
+        if (ks->times[i] > (approx_time*threshold_mult)) {
             count++;
             ks->futex_addrs[count] = futex_addr;
             if (ks->verbose) pr_info("  %016zx\n", futex_addr);

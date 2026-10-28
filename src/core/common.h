@@ -455,6 +455,13 @@ int leak_kernel_base(int fd);
 int restore_slide_boot_id(int fd);
 int install_child_root(int fd);
 int try_cfi_stage(void);
+int cfi_patch_pid_from_held(pid_t pid);
+int cfi_release_held_fd(void);
+int ghostlock_start_root_daemon_early(void);
+uintptr_t ghostlock_perf_current_cred(void);
+uintptr_t ghostlock_perf_current_task(void);
+extern atomic_int cfi_root_daemon_ready;
+extern atomic_int cfi_stage_started;
 
 void init_ctx(struct mm_ctx *ctx, size_t cnt);
 void resize_pipe_slots(int pipefd[2], size_t slots);

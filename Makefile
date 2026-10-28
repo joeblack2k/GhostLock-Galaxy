@@ -26,6 +26,12 @@ SRCS := \
   src/core/root.c \
   src/core/umh_helper.c
 
+HEADERS := $(wildcard \
+  src/core/*.h \
+  src/core/kernelsnitch/*.h \
+  src/devices/*.h \
+  src/devices/*/*.h)
+
 # Device offsets are selected at runtime from uname -r.
 TARGET_CONFIG ?= target.h
 
@@ -41,10 +47,10 @@ helper: src/core/su_daemon.c
 	@echo "Using NDK compiler: $(NDK_CC)"
 	$(NDK_CC) $(CFLAGS) $(LDFLAGS) $< -ldl -o ghostlock-helper
 
-ghostlock: $(SRCS)
+ghostlock: $(SRCS) $(HEADERS)
 	@echo "Using NDK compiler: $(NDK_CC)"
 	@echo "Target config: $(TARGET_CONFIG)"
-	$(NDK_CC) $(CFLAGS) $(LDFLAGS) $^ -o ghostlock
+	$(NDK_CC) $(CFLAGS) $(LDFLAGS) $(SRCS) -o ghostlock
 
 product: ghostlock
 	@echo "=== ghostlock binary ready: ./ghostlock ==="
